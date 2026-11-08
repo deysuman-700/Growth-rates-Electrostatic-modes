@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import SymLogNorm
+from scipy.optimize import minimize, minimize_scalar
 try:
     import scienceplots 
     plt.style.use('science')
@@ -23,10 +24,8 @@ def make_dists(params, kappas):
     ds.append(('Gaussian', Distribution('gaussian', None, params)))
     ds.append(('Maxwell-Jüttner', Distribution('maxwell_juttner', None, params)))
     return ds
-def scan_axes(params, nkpar, nkperp, kperp_max=3.0):
-    centre = params.k_parallel_resonant_centre
-    dk = params.dk_parallel_per_sigma
-    kpar = np.linspace(centre - 4.0*dk, centre + 4.0*dk, nkpar)
+def scan_axes(params, nkpar, nkperp, kperp_max=0.6, kpar_min=1.003, kpar_max=1.012):
+    kpar = np.linspace(kpar_min, kpar_max, nkpar)
     
     k_transition = min(float(kperp_max), max(0.1, 6.0 * params.sigma_perp_1d / params.p0))
     n_linear = max(5, int(round(0.55 * nkperp)))
@@ -88,7 +87,7 @@ def format_distribution_title(label):
         value = label.split('=', 1)[1]
         return rf'$\kappa={value}$'
     return label
-def plot_growth_maps(outdir, kpar, kperp, maps, labels):
+def plot_growth_maps(outdir, kpar, kperp, maps, labels, maxima):
     n = len(maps)
     ncols = 3
     nrows = int(np.ceil(n/ncols))
@@ -113,9 +112,10 @@ def plot_growth_maps(outdir, kpar, kperp, maps, labels):
         ax = axes.flat[i]
         im = ax.contourf(kpar, kperp, m, levels=levels, norm=norm,
                          cmap='RdBu_r', extend='both')
-        idx = np.unravel_index(np.nanargmax(m), m.shape)
-        ax.plot(kpar[idx[1]], kperp[idx[0]], marker='*', linestyle='none',
-                ms=10, color='black', markeredgecolor='white', label='grid maximum')
+        result = maxima[i]
+        ax.plot(result['K_parallel_max'], result['K_perp_max'], marker='*',
+                linestyle='none', ms=10, color='black', markeredgecolor='white',
+                label='Maximum growth')
         ax.set_title(format_distribution_title(label), fontsize=14)
         ax.set_xlabel(r'$k_\parallel c/\omega_{pe}$', fontsize=13)
         ax.set_ylabel(r'$k_\perp c/\omega_{pe}$', fontsize=13)
@@ -142,6 +142,49 @@ def summarize_map(growth, kpar, kperp):
     return {'Gamma_max_over_omega_pe': gmax, 'K_parallel_max': kz,
             'K_perp_max': kx, 'theta_k_deg': theta,
             'max_is_positive': bool(gmax > 0.0)}
+def optimize_growth(dist, kpar, kperp, growth, rmax, n_r, n_phi,
+                    bounds=((1.003, 1.030), (0.0, 0.6))):
+    def rate(kz, kx):
+        kz = float(np.clip(kz, *bounds[0]))
+        kx = float(np.clip(kx, *bounds[1]))
+        return gamma_over_omega_pe(kz, kx, dist, rmax, n_r=n_r, n_phi=n_phi)
+
+    parallel = minimize_scalar(
+        lambda kz: -rate(kz, 0.0), bounds=bounds[0], method='bounded',
+        options={'xatol': 1e-11},
+    )
+    candidates = [(float(parallel.x), 0.0)]
+    indices = np.argsort(growth.ravel())[-6:]
+    for index in indices:
+        i, j = np.unravel_index(index, growth.shape)
+        candidates.append((float(kpar[j]), float(kperp[i])))
+    candidates.extend([(1.00735, 0.18582), (1.0053, 0.0)])
+
+    best = (rate(*candidates[0]), *candidates[0])
+    for candidate in candidates:
+        opt = minimize(
+            lambda x: -1e6*rate(x[0], x[1]), x0=np.asarray(candidate),
+            method='Powell', bounds=bounds,
+            options={'xtol': 1e-9, 'ftol': 1e-11, 'maxiter': 160},
+        )
+        for point in (candidate, opt.x):
+            kz, kx = map(float, point)
+            value = rate(kz, kx)
+            if value > best[0]:
+                best = (value, kz, kx)
+
+    value, kz, kx = best
+    if kx < 1e-7:
+        kx = 0.0
+        value = rate(kz, kx)
+    return {
+        'Gamma_max_over_omega_pe': value,
+        'K_parallel_max': kz,
+        'K_perp_max': kx,
+        'theta_k_deg': float(np.degrees(np.arctan2(kx, kz))),
+        'max_is_positive': bool(value > 0),
+    }
+
 def plot_kappa_trends(outdir, kappas, summary_rows):
     finite = [row for row in summary_rows if str(row['distribution']).startswith('kappa=')]
     gauss = next(row for row in summary_rows if row['distribution'] == 'Gaussian')
@@ -165,14 +208,14 @@ def plot_kappa_trends(outdir, kappas, summary_rows):
     axes[1].axhline(float(gauss['theta_k_deg']), ls='--', label='matched Gaussian')
     axes[1].set_xlabel(r'$\kappa$')
     axes[1].set_ylabel(r'$\theta_{k,\max}$ (degrees)')
-    axes[1].set_title('Angle of grid-maximum mode')
+    axes[1].set_title('Direction of maximum growth')
     for ax in axes:
-        ax.grid(True, which='both', alpha=0.25)
+        ax.grid(False)
         ax.legend(fontsize=8)
-    fig.savefig(outdir/'03_gamma_max_and_angle_vs_kappa.png', dpi=220)
+    fig.savefig(outdir/'03_gamma_max_and_angle_vs_kappa.png', dpi=800)
     plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(5.8, 4.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
     ax.semilogx(kk, ratio_gauss, 'o-', label=r'$\zeta_{\max,\kappa}/\zeta_{\max,\mathrm{G}}$')
     ax.semilogx(kk, ratio_mj, 's--', label=r'$\zeta_{\max,\kappa}/\zeta_{\max,\mathrm{MJ}}$')
     ax.axhline(1.0, color='black', ls=':', lw=1)
@@ -180,8 +223,8 @@ def plot_kappa_trends(outdir, kappas, summary_rows):
     ax.set_ylabel('Growth-rate ratio', fontsize=13)
     ax.legend(fontsize=10)
 
-    ax.grid(False)#, which='both', alpha=0.25)
-    fig.savefig(outdir/'04_growth_ratio_vs_kappa.png', dpi=500)
+    ax.grid(False)
+    fig.savefig(outdir/'04_growth_ratio_vs_kappa.png', dpi=800)
     plt.close(fig)
 def plot_rmax_convergence(outdir, params, kappa, kpar, kperp, rmax_sigmas, n_r, n_phi):
     dist = Distribution('kappa', kappa, params)
@@ -199,7 +242,7 @@ def plot_rmax_convergence(outdir, params, kappa, kpar, kperp, rmax_sigmas, n_r, 
                      'Gamma_over_omega_pe': val})
     save_csv(outdir/'convergence_rmax.csv', rows,
              ['r_max_over_sigma_perp', 'r_max', 'n_r', 'n_phi', 'Gamma_over_omega_pe'])
-    fig, ax = plt.subplots(figsize=(5.8, 4.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
     ax.plot([r['r_max_over_sigma_perp'] for r in rows], vals, 'o-')
     ax.set_xlabel(r'$r_{\max}/\sigma_{\perp,1D}$')
     ax.set_ylabel(r'$\zeta/\omega_{pe}$')
@@ -208,7 +251,6 @@ def plot_rmax_convergence(outdir, params, kappa, kpar, kperp, rmax_sigmas, n_r, 
     fig.savefig(outdir/'05_convergence_rmax.png', dpi=220)
     plt.close(fig)
 def plot_quadrature_convergence(outdir, params, kappa, kpar, kperp, rmax, quick=False):
-    """Check fixed-point quadrature-order convergence for a selected kappa."""
     dist = Distribution('kappa', kappa, params)
     orders = [(32, 24), (48, 32), (72, 48), (104, 64)] if quick else [
         (48, 32), (72, 48), (104, 64), (144, 88), (200, 120), (260, 160)
@@ -239,7 +281,6 @@ def plot_quadrature_convergence(outdir, params, kappa, kpar, kperp, rmax, quick=
     fig.savefig(outdir/'06_quadrature_convergence.png', dpi=220)
     plt.close(fig)
 def plot_wavegrid_convergence(outdir, params, kappa, kperp_max, rmax, nkpar, nkperp, quick=False):
-    """Test how the maximum changes as the wavevector grid is refined."""
     dist = Distribution('kappa', kappa, params)
     grids = [
         (max(13, nkpar//4), max(9, nkperp//3)),
@@ -272,12 +313,10 @@ def plot_wavegrid_convergence(outdir, params, kappa, kperp_max, rmax, nkpar, nkp
     axes[0].set_xticks(range(len(rows)), labels)
     axes[0].set_xlabel(r'Grid size (parallel $\times$ transverse)', fontsize=13)
     axes[0].set_ylabel(r'$\zeta_{\max,\kappa}/\omega_{pe}$', fontsize=13)
-    #axes[0].set_title('Wavevector-grid convergence')
     axes[1].semilogy(range(len(rows)), [max(r['relative_difference_from_finest'],1e-16) for r in rows], 'o-')
     axes[1].set_xticks(range(len(rows)), labels)
     axes[1].set_xlabel(r'Grid size (parallel $\times$ transverse)', fontsize=13)
     axes[1].set_ylabel('Relative difference from finest grid', fontsize=13)
-    #axes[1].set_title('Maximum-growth convergence')
     for ax in axes:
         ax.grid(False)#, alpha=0.25)
         ax.text(0.06, 0.95, rf'$\kappa = {kappa:g}$', transform=ax.transAxes, ha='left',
@@ -299,7 +338,10 @@ def main():
     parser.add_argument('--n-phi', type=int, default=80)
     parser.add_argument('--nkpar', type=int, default=81)
     parser.add_argument('--nkperp', type=int, default=41)
-    parser.add_argument('--kperp-max', type=float, default=3.0, help='maximum scanned K_perp; use broad enough range to test oblique modes')
+    parser.add_argument('--kperp-max', type=float, default=0.6)
+    parser.add_argument('--kpar-min', type=float, default=1.003)
+    parser.add_argument('--kpar-max', type=float, default=1.012)
+    parser.add_argument('--opt-kpar-max', type=float, default=1.030)
     parser.add_argument('--r-max-sigmas', type=float, default=20.0)
     parser.add_argument('--quick', action='store_true', help='reduce grid sizes for a fast smoke test')
     args = parser.parse_args()
@@ -318,10 +360,10 @@ def main():
         f'predicted sigma_parallel={mj_dist.mj_sigma_parallel:.6g} m_e c '
         f'(requested kappa/Gaussian width={params.sigma_parallel:.6g} m_e c).'
     )
-    kpar, kperp = scan_axes(params, args.nkpar, args.nkperp, kperp_max=args.kperp_max)
+    kpar, kperp = scan_axes(params, args.nkpar, args.nkperp, kperp_max=args.kperp_max,
+                           kpar_min=args.kpar_min, kpar_max=args.kpar_max)
     rmax = args.r_max_sigmas * params.sigma_perp_1d
     config = {
-        'warning': 'Illustrative defaults; replace with physically justified beam parameters before publication.',
         'alpha_nb_over_np': params.alpha, 'p0_over_mec': params.p0,
         'sigma_parallel_1d_over_mec': params.sigma_parallel,
         'sigma_perp_1d_over_mec': params.sigma_perp_1d,
@@ -329,6 +371,7 @@ def main():
         'r_max_over_mec': rmax, 'n_r': args.n_r, 'n_phi': args.n_phi,
         'nkpar': args.nkpar, 'nkperp': args.nkperp,
         'kpar_min': float(kpar.min()), 'kpar_max': float(kpar.max()),
+        'optimized_kpar_max': args.opt_kpar_max,
         'kperp_min': float(kperp.min()), 'kperp_max': float(kperp.max()),
         'model': 'weak-beam electrostatic Langmuir branch; cold background; K_parallel>1'
     }
@@ -351,7 +394,10 @@ def main():
         growth = scan_growth_rate(dist, kpar, kperp, rmax, n_r=args.n_r, n_phi=args.n_phi)
         maps.append(growth)
         labels.append(label)
-        summary = summarize_map(growth, kpar, kperp)
+        summary = optimize_growth(dist, kpar, kperp, growth, rmax,
+                                  n_r=args.n_r, n_phi=args.n_phi,
+                                  bounds=((args.kpar_min, args.opt_kpar_max),
+                                          (0.0, args.kperp_max)))
         summary['distribution'] = label
         summary['kappa'] = float(dist.kappa) if dist.kind == 'kappa' else ''
         rows.append(summary)
@@ -359,7 +405,7 @@ def main():
         np.savetxt(args.outdir/f'growth_map_{safe_label}.csv', growth, delimiter=',',
                    header='rows=k_perp increasing; columns=k_parallel increasing', comments='')
         print('  ', summary)
-    plot_growth_maps(args.outdir, kpar, kperp, maps, labels)
+    plot_growth_maps(args.outdir, kpar, kperp, maps, labels, rows)
     save_csv(args.outdir/'growth_maxima.csv', rows,
              ['distribution', 'kappa', 'Gamma_max_over_omega_pe', 'K_parallel_max',
               'K_perp_max', 'theta_k_deg', 'max_is_positive'])
@@ -380,6 +426,5 @@ def main():
     print('Figures:')
     for path in sorted(args.outdir.glob('*.png')):
         print(' ', path.name)
-    print('\nReminder: these outputs are numerical results for the illustrative parameter defaults, not paper-ready physical conclusions.')
 if __name__ == '__main__':
     main()
